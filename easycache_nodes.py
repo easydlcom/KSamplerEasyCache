@@ -247,6 +247,18 @@ class KSamplerEasyCache:
         print(f"EasyCache enabled: threshold={easycache_threshold}, warmup_steps={easycache_warmup_steps}")
 
         try:
+
+            # --- START DEBUGGING PRINTS ---
+            print(f"DEBUG KSamplerEasyCache Input: Type of 'positive': {type(positive)}")
+            print(f"DEBUG KSamplerEasyCache Input: Type of 'negative': {type(negative)}")
+            # For CONDITIONING, it's typically a list of lists. Printing full content might be too verbose.
+            # Let's print the first element of positive if it's a list/tuple to check content.
+            if isinstance(positive, (list, tuple)) and len(positive) > 0:
+                print(f"DEBUG KSamplerEasyCache Input: First element of 'positive': {str(positive[0])[:100]}...")
+            if isinstance(negative, (list, tuple)) and len(negative) > 0:
+                print(f"DEBUG KSamplerEasyCache Input: First element of 'negative': {str(negative[0])[:100]}...")
+            # --- END DEBUGGING PRINTS ---
+            
             # 调用 ComfyUI 内部的采样逻辑
             # EasyCache 的加速发生在 model.model.forward 内部，对 ComfyUI KSampler 来说是透明的
             latent_output = samplers.sample(
