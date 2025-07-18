@@ -162,6 +162,7 @@ class KSamplerEasyCache:
 
         try:
             # Debugging prints (can be commented out for production use)
+            print(f"DEBUG update 1")
             print(f"DEBUG KSamplerEasyCache Input: Type of 'model': {type(original_underlying_model)}")
             print(f"DEBUG KSamplerEasyCache Input: Type of 'positive': {type(positive)}")
             if isinstance(positive, list) and len(positive) > 0:
@@ -186,7 +187,7 @@ class KSamplerEasyCache:
                 negative_copy = [negative_copy] # Wrap it in a list
             # --- END DEFENSIVE CHECKS ---
 
-            print(f"DEBUG remove our wrapper model patching for this test")
+            
             # Create an instance of our wrapper model (still created, but NOT used to patch model.model)
             # easycache_wrapper_instance = EasyCacheModelWrapper( # Commented for this test
             #     inner_model=original_underlying_model,
