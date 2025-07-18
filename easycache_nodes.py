@@ -1,7 +1,6 @@
 import torch
 import os
-# Add the missing import statement for folder_paths
-import folder_paths # <--- ADD THIS LINE
+import folder_paths
 import comfy.model_management as model_management
 import comfy.samplers as samplers
 import comfy.sd
@@ -9,103 +8,123 @@ from tqdm import tqdm
 import torch.nn.functional as F
 import math
 import numpy as np
+import copy
+import hashlib # For robust cache key generation
 
-# --- EasyCache Core Logic Wrapper ---
-# This function intercepts the model.forward calls and applies EasyCache logic.
-def easycache_forward_wrapper(original_forward_func, instance, x, timesteps, context, **kwargs):
-    """
-    Wraps the original model's forward method to integrate EasyCache acceleration.
-    Receives arguments as ComfyUI's model.forward usually passes them.
-    """
-    # Map ComfyUI's 'timesteps' to EasyCache/Wan's 't'
-    t = timesteps
+# --- EasyCacheModelWrapper Class ---
+# This class wraps the original model and contains the caching logic and state.
+class EasyCacheModelWrapper(torch.nn.Module):
+    def __init__(self, inner_model, easycache_threshold, easycache_warmup_steps, total_steps):
+        super().__init__()
+        self.inner_model = inner_model
+        
+        # EasyCache state variables, now instance-specific
+        self.easycache_cnt = 0
+        self.easycache_thresh = easycache_threshold
+        self.easycache_ret_steps = easycache_warmup_steps * 2 # Multiply by 2 for cond/uncond passes
+        self.easycache_cutoff_steps = total_steps * 2 - 2 # Total forward passes - 2 (for last pair)
+        self.easycache_accumulated_error_even = 0
+        self.easycache_should_calc_current_pair = True
+        self.easycache_previous_raw_input_even = None
+        self.easycache_previous_raw_output_even = None
+        self.easycache_previous_raw_output_odd = None
+        self.easycache_prev_prev_raw_input_even = None
+        self.easycache_cache_even = None
+        self.easycache_cache_odd = None
+        self.easycache_num_steps = total_steps * 2
+        self.easycache_k = None # To detect new sampling runs
 
-    # Extract other potential Wan-specific arguments from kwargs.
-    # If ComfyUI's model.forward doesn't provide these, they will remain None.
-    seq_len = kwargs.get('seq_len')
-    clip_fea = kwargs.get('clip_fea')
-    y = kwargs.get('y')
+        # Cache storage (simple dict for now, can be extended with LRU)
+        self.cache = {}
 
-    # Ensure this is the actual model module being patched, not a wrapper.
-    # The 'instance' object now holds the easycache_ state variables.
+    # Placeholder for more complex key generation (not strictly used in current EasyCache logic, but good practice)
+    def _generate_cache_key(self, x, timesteps, context):
+        # A simple key based on statistical properties and timestep
+        # For actual EasyCache, it relies on sequential calls and internal state.
+        # This function would be more relevant if we were caching arbitrary 'forward' calls.
+        
+        # Hash of timestep
+        t_hash = str(timesteps.item()) if isinstance(timesteps, torch.Tensor) else str(timesteps)
+        
+        # For x, use a small, fixed-size representation (e.g., mean and std deviation)
+        # Avoid full tensor hashing for performance
+        x_mean = x.mean().item()
+        x_std = x.std().item()
+        
+        # For context (conditioning), hashing its content can be complex.
+        # For simplicity, if context is a list of tensors/dicts, hash a summary.
+        # For now, relying on sequential nature of EasyCache.
+        
+        # This key isn't directly used by EasyCache's logic, which relies on easycache_cnt and state.
+        # It's a conceptual suggestion for a more general caching wrapper.
+        return f"{t_hash}_{x_mean:.4f}_{x_std:.4f}"
 
-    # === EasyCache State Initialization and Logic ===
-    # Check if a new sampling process or a new batch has started.
-    # This logic assumes sequential calls to the forward function during sampling.
-    if instance.easycache_k is None: # First call for a new KSampler run or new batch
-        instance.easycache_k = torch.zeros(instance.easycache_num_steps, dtype=torch.long, device=x.device)
-        instance.easycache_cnt = 0
-        instance.easycache_accumulated_error_even = 0
-        instance.easycache_should_calc_current_pair = True
-        instance.easycache_previous_raw_input_even = None
-        instance.easycache_previous_raw_output_even = None
-        instance.easycache_previous_raw_output_odd = None
-        instance.easycache_prev_prev_raw_input_even = None
-        instance.easycache_cache_even = None
-        instance.easycache_cache_odd = None
+    def forward(self, x, timesteps, context, **kwargs):
+        """
+        Intercepts the model's forward call and applies EasyCache logic.
+        """
+        # Map ComfyUI's 'timesteps' to EasyCache/Wan's 't'
+        t = timesteps
 
+        # Determine if it's an even or odd step for caching logic
+        is_even = self.easycache_cnt % 2 == 0
 
-    # Determine if it's an even or odd step for caching logic
-    is_even = instance.easycache_cnt % 2 == 0
+        if self.easycache_cnt < self.easycache_ret_steps or self.easycache_should_calc_current_pair:
+            # Perform full calculation (warmup phase or when error threshold is exceeded)
+            output = self.inner_model(x, timesteps, context, **kwargs)
 
-    if instance.easycache_cnt < instance.easycache_ret_steps or instance.easycache_should_calc_current_pair:
-        # Perform full calculation (warmup phase or when error threshold is exceeded)
-        # Call the original forward function with the arguments it expects from ComfyUI
-        output = original_forward_func(x, timesteps, context, **kwargs)
+            if is_even:
+                self.easycache_previous_raw_input_even = x.detach().clone()
+                self.easycache_previous_raw_output_even = output.detach().clone()
+                self.easycache_cache_even = output.detach().clone() # Cache for even steps
+            else:
+                self.easycache_previous_raw_output_odd = output.detach().clone()
+                self.easycache_cache_odd = output.detach().clone() # Cache for odd steps
 
-        if is_even:
-            instance.easycache_previous_raw_input_even = x.detach().clone()
-            instance.easycache_previous_raw_output_even = output.detach().clone()
-            instance.easycache_cache_even = output.detach().clone() # Cache for even steps
+            self.easycache_should_calc_current_pair = False # Reset for next pair
+            self.easycache_accumulated_error_even = 0 # Reset error after full calculation
         else:
-            instance.easycache_previous_raw_output_odd = output.detach().clone()
-            instance.easycache_cache_odd = output.detach().clone() # Cache for odd steps
+            # Try to use cached results
+            if is_even:
+                if self.easycache_cache_even is not None:
+                    output = self.easycache_cache_even.clone()
+                else:
+                    # Fallback if cache is somehow empty (should not happen in normal flow)
+                    print("EasyCache: Even cache miss, performing full computation.")
+                    output = self.inner_model(x, timesteps, context, **kwargs)
+            else: # Odd step
+                if self.easycache_cache_odd is not None:
+                    output = self.easycache_cache_odd.clone()
+                else:
+                    print("EasyCache: Odd cache miss, performing full computation.")
+                    output = self.inner_model(x, timesteps, context, **kwargs)
 
-        instance.easycache_should_calc_current_pair = False # Reset for next pair
-        instance.easycache_accumulated_error_even = 0 # Reset error after full calculation
-    else:
-        # Try to use cached results
-        if is_even:
-            if instance.easycache_cache_even is not None:
-                output = instance.easycache_cache_even.clone()
-            else:
-                # Fallback if cache is somehow empty (should not happen in normal flow)
-                print("EasyCache: Even cache miss, performing full computation.")
-                output = original_forward_func(x, timesteps, context, **kwargs)
-        else: # Odd step
-            if instance.easycache_cache_odd is not None:
-                output = instance.easycache_cache_odd.clone()
-            else:
-                print("EasyCache: Odd cache miss, performing full computation.")
-                output = original_forward_func(x, timesteps, context, **kwargs)
+            # Update accumulated error for even steps (this logic is specific to EasyCache)
+            if is_even and self.easycache_previous_raw_input_even is not None and self.easycache_cnt > 0:
+                if self.easycache_cnt == self.easycache_ret_steps:
+                    self.easycache_prev_prev_raw_input_even = self.easycache_previous_raw_input_even.detach().clone()
+                else:
+                    if self.easycache_prev_prev_raw_input_even is not None:
+                        # Calculate L1 distance (mean absolute error) between current and previous input
+                        l1_distance = torch.mean(torch.abs(x - self.easycache_prev_prev_raw_input_even))
+                        self.easycache_accumulated_error_even += l1_distance.item()
 
-        # Update accumulated error for even steps (this logic is specific to EasyCache)
-        if is_even and instance.easycache_previous_raw_input_even is not None and instance.easycache_cnt > 0:
-            if instance.easycache_cnt == instance.easycache_ret_steps:
-                 instance.easycache_prev_prev_raw_input_even = instance.easycache_previous_raw_input_even.detach().clone()
-            else:
-                if instance.easycache_prev_prev_raw_input_even is not None:
-                    # Calculate L1 distance (mean absolute error) between current and previous input
-                    l1_distance = torch.mean(torch.abs(x - instance.easycache_prev_prev_raw_input_even))
-                    instance.easycache_accumulated_error_even += l1_distance.item()
+                if self.easycache_accumulated_error_even > self.easycache_thresh:
+                    self.easycache_should_calc_current_pair = True
+                    self.easycache_accumulated_error_even = 0 # Reset error after triggering recalculation
 
-            if instance.easycache_accumulated_error_even > instance.easycache_thresh:
-                instance.easycache_should_calc_current_pair = True
-                instance.easycache_accumulated_error_even = 0 # Reset error after triggering recalculation
+                self.easycache_prev_prev_raw_input_even = self.easycache_previous_raw_input_even.detach().clone()
+                self.easycache_previous_raw_input_even = x.detach().clone()
+                self.easycache_previous_raw_output_even = output.detach().clone()
 
-            instance.easycache_prev_prev_raw_input_even = instance.easycache_previous_raw_input_even.detach().clone()
-            instance.easycache_previous_raw_input_even = x.detach().clone()
-            instance.easycache_previous_raw_output_even = output.detach().clone()
+        self.easycache_cnt += 1 # Increment step counter
 
-    instance.easycache_cnt += 1 # Increment step counter
-
-    return output
+        return output
 
 # --- KSampler (EasyCache) Custom Node ---
 class KSamplerEasyCache:
     def __init__(self):
-        # Correctly access get_output_directory via the imported folder_paths module
-        self.output_dir = folder_paths.get_output_directory() # <--- MODIFIED LINE
+        self.output_dir = folder_paths.get_output_directory()
         self.filename_prefix = 'ComfyUI'
 
     @classmethod
@@ -142,92 +161,47 @@ class KSamplerEasyCache:
                 model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise
             )
 
-        # Get the actual torch.nn.Module model from the ComfyUI wrapper
-        actual_model_module = model.model
-        original_forward = actual_model_module.forward
-
-        # Prepare EasyCache's state variables and inject them into the actual model module.
-        # These are instance-specific and will be cleaned up in the 'finally' block.
-        actual_model_module.easycache_cnt = 0
-        actual_model_module.easycache_thresh = easycache_threshold
-        # EasyCache internally counts conditional and unconditional passes, so multiply steps by 2
-        actual_model_module.easycache_ret_steps = easycache_warmup_steps * 2
-        actual_model_module.easycache_cutoff_steps = steps * 2 - 2 # Total forward passes - 2 (for last pair)
-        actual_model_module.easycache_accumulated_error_even = 0
-        actual_model_module.easycache_should_calc_current_pair = True
-        actual_model_module.easycache_previous_raw_input_even = None
-        actual_model_module.easycache_previous_raw_output_even = None
-        actual_model_module.easycache_previous_raw_output_odd = None
-        actual_model_module.easycache_prev_prev_raw_input_even = None
-        actual_model_module.easycache_cache_even = None
-        actual_model_module.easycache_cache_odd = None
-        actual_model_module.easycache_num_steps = steps * 2
-        actual_model_module.easycache_k = None # Initialize to None to detect new sampling runs
-
-        # Define the patched forward function.
-        # This signature (x, timesteps, context, **kwargs) matches how ComfyUI
-        # typically calls the underlying model's forward method.
-        def _patched_forward(x, timesteps, context, **kwargs):
-            # Pass all arguments directly to our easycache_forward_wrapper,
-            # along with the original forward function and the model instance.
-            return easycache_forward_wrapper(original_forward, actual_model_module, x, timesteps, context, **kwargs)
-
-        # Apply the patch: replace the model's original forward with our patched version.
-        actual_model_module.forward = _patched_forward
-
+        # Store the original underlying model from the ModelPatcher
+        original_underlying_model = model.model
+        
         print(f"EasyCache enabled: threshold={easycache_threshold}, warmup_steps={easycache_warmup_steps}")
 
         try:
             # Debugging prints (can be commented out for production use)
             print(f"DEBUG KSamplerEasyCache Input: Type of 'positive': {type(positive)}")
+            print(f"DEBUG KSamplerEasyCache Input: First element of 'positive': {str(positive[0])[:100]}...")
             print(f"DEBUG KSamplerEasyCache Input: Type of 'negative': {type(negative)}")
-            if isinstance(positive, (list, tuple)) and len(positive) > 0:
-                print(f"DEBUG KSamplerEasyCache Input: First element of 'positive': {str(positive[0])[:100]}...")
-            if isinstance(negative, (list, tuple)) and len(negative) > 0:
-                print(f"DEBUG KSamplerEasyCache Input: First element of 'negative': {str(negative[0])[:100]}...")
+            print(f"DEBUG KSamplerEasyCache Input: First element of 'negative': {str(negative[0])[:100]}...")
 
-            # Call ComfyUI's standard samplers.sample, which will now use our patched model.forward
+            # Perform deepcopy on positive and negative conditioning lists
+            # This helps to isolate them from any potential unexpected in-place modifications
+            positive_copy = copy.deepcopy(positive)
+            negative_copy = copy.deepcopy(negative)
+
+            # Create an instance of our wrapper model
+            # This wrapper will manage its own EasyCache state and call the original model's forward.
+            easycache_wrapper_instance = EasyCacheModelWrapper(
+                inner_model=original_underlying_model,
+                easycache_threshold=easycache_threshold,
+                easycache_warmup_steps=easycache_warmup_steps,
+                total_steps=steps
+            )
+
+            # Temporarily replace the underlying model in the ComfyUI ModelPatcher
+            # Now, when ComfyUI's samplers call model.forward(), it will be routed to our wrapper.
+            model.model = easycache_wrapper_instance
+
+            # Call ComfyUI's standard samplers.sample
             latent_output = samplers.sample(
-                model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise
+                model, seed, steps, cfg, sampler_name, scheduler, positive_copy, negative_copy, latent_image, denoise
             )
 
             print("EasyCache KSampler sampling completed.")
 
         finally:
-            # IMPORTANT: Always restore the original forward method to prevent side effects
-            # for subsequent operations or other nodes in the workflow.
-            actual_model_module.forward = original_forward
-
-            # Clean up EasyCache specific attributes from the model instance
-            # to ensure a clean state for future runs or other model uses.
-            if hasattr(actual_model_module, 'easycache_cnt'): # Check before deleting
-                del actual_model_module.easycache_cnt
-            if hasattr(actual_model_module, 'easycache_thresh'):
-                del actual_model_module.easycache_thresh
-            if hasattr(actual_model_module, 'easycache_ret_steps'):
-                del actual_model_module.easycache_ret_steps
-            if hasattr(actual_model_module, 'easycache_cutoff_steps'):
-                del actual_model_module.easycache_cutoff_steps
-            if hasattr(actual_model_module, 'easycache_accumulated_error_even'):
-                del actual_model_module.easycache_accumulated_error_even
-            if hasattr(actual_model_module, 'easycache_should_calc_current_pair'):
-                del actual_model_module.easycache_should_calc_current_pair
-            if hasattr(actual_model_module, 'easycache_previous_raw_input_even'):
-                del actual_model_module.easycache_previous_raw_input_even
-            if hasattr(actual_model_module, 'easycache_previous_raw_output_even'):
-                del actual_model_module.easycache_previous_raw_output_even
-            if hasattr(actual_model_module, 'easycache_previous_raw_output_odd'):
-                del actual_model_module.easycache_previous_raw_output_odd
-            if hasattr(actual_model_module, 'easycache_prev_prev_raw_input_even'):
-                del actual_model_module.easycache_prev_prev_raw_input_even
-            if hasattr(actual_model_module, 'easycache_cache_even'):
-                del actual_model_module.easycache_cache_even
-            if hasattr(actual_model_module, 'easycache_cache_odd'):
-                del actual_model_module.easycache_cache_odd
-            if hasattr(actual_model_module, 'easycache_num_steps'):
-                del actual_model_module.easycache_num_steps
-            if hasattr(actual_model_module, 'easycache_k'):
-                del actual_model_module.easycache_k
+            # IMPORTANT: Always restore the original underlying model to the ModelPatcher
+            # This ensures that other nodes or subsequent runs use the unpatched model.
+            model.model = original_underlying_model
 
         return (latent_output,)
 
