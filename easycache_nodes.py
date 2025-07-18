@@ -1,5 +1,7 @@
 import torch
 import os
+# Add the missing import statement for folder_paths
+import folder_paths # <--- ADD THIS LINE
 import comfy.model_management as model_management
 import comfy.samplers as samplers
 import comfy.sd
@@ -102,7 +104,8 @@ def easycache_forward_wrapper(original_forward_func, instance, x, timesteps, con
 # --- KSampler (EasyCache) Custom Node ---
 class KSamplerEasyCache:
     def __init__(self):
-        self.output_dir = comfy.folder_paths.get_output_directory()
+        # Correctly access get_output_directory via the imported folder_paths module
+        self.output_dir = folder_paths.get_output_directory() # <--- MODIFIED LINE
         self.filename_prefix = 'ComfyUI'
 
     @classmethod
