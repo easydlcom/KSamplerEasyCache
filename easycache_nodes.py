@@ -168,6 +168,7 @@ class KSamplerEasyCache:
 
         try:
             # Debugging prints (can be commented out for production use)
+            print(f"DEBUG KSamplerEasyCache Input: Type of 'model': {type(original_underlying_model)}")
             print(f"DEBUG KSamplerEasyCache Input: Type of 'positive': {type(positive)}")
             print(f"DEBUG KSamplerEasyCache Input: First element of 'positive': {str(positive[0])[:100]}...")
             print(f"DEBUG KSamplerEasyCache Input: Type of 'negative': {type(negative)}")
