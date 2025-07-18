@@ -186,6 +186,7 @@ class KSamplerEasyCache:
                 negative_copy = [negative_copy] # Wrap it in a list
             # --- END DEFENSIVE CHECKS ---
 
+            print(f"DEBUG remove our wrapper model patching for this test")
             # Create an instance of our wrapper model (still created, but NOT used to patch model.model)
             # easycache_wrapper_instance = EasyCacheModelWrapper( # Commented for this test
             #     inner_model=original_underlying_model,
