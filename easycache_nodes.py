@@ -155,12 +155,6 @@ class KSamplerEasyCache:
     def sample(self, model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise,
                easycache_enabled, easycache_threshold, easycache_warmup_steps):
 
-        if not easycache_enabled:
-            print("EasyCache is disabled. Running standard KSampler.")
-            return samplers.sample(
-                model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise
-            )
-
         # Store the original underlying model from the ModelPatcher
         original_underlying_model = model.model
         
@@ -170,39 +164,63 @@ class KSamplerEasyCache:
             # Debugging prints (can be commented out for production use)
             print(f"DEBUG KSamplerEasyCache Input: Type of 'model': {type(original_underlying_model)}")
             print(f"DEBUG KSamplerEasyCache Input: Type of 'positive': {type(positive)}")
-            print(f"DEBUG KSamplerEasyCache Input: First element of 'positive': {str(positive[0])[:100]}...")
+            if isinstance(positive, list) and len(positive) > 0:
+                print(f"DEBUG KSamplerEasyCache Input: First element of 'positive': {str(positive[0])[:100]}...")
             print(f"DEBUG KSamplerEasyCache Input: Type of 'negative': {type(negative)}")
-            print(f"DEBUG KSamplerEasyCache Input: First element of 'negative': {str(negative[0])[:100]}...")
+            if isinstance(negative, list) and len(negative) > 0:
+                print(f"DEBUG KSamplerEasyCache Input: First element of 'negative': {str(negative[0])[:100]}...")
 
             # Perform deepcopy on positive and negative conditioning lists
-            # This helps to isolate them from any potential unexpected in-place modifications
             positive_copy = copy.deepcopy(positive)
             negative_copy = copy.deepcopy(negative)
 
-            # Create an instance of our wrapper model
-            # This wrapper will manage its own EasyCache state and call the original model's forward.
-            easycache_wrapper_instance = EasyCacheModelWrapper(
-                inner_model=original_underlying_model,
-                easycache_threshold=easycache_threshold,
-                easycache_warmup_steps=easycache_warmup_steps,
-                total_steps=steps
-            )
+            # --- DEFENSIVE CHECKS BEFORE CALLING SAMPLERS.SAMPLE ---
+            # Ensure positive_copy and negative_copy are lists.
+            # This is a very defensive measure in case an upstream process or
+            # a highly unusual edge case transforms them into an int or other non-iterable.
+            if not isinstance(positive_copy, list):
+                print(f"WARNING: positive_copy unexpectedly not a list. Attempting to cast. Was: {type(positive_copy)}")
+                positive_copy = [positive_copy] # Wrap it in a list
+            if not isinstance(negative_copy, list):
+                print(f"WARNING: negative_copy unexpectedly not a list. Attempting to cast. Was: {type(negative_copy)}")
+                negative_copy = [negative_copy] # Wrap it in a list
+            # --- END DEFENSIVE CHECKS ---
 
-            # Temporarily replace the underlying model in the ComfyUI ModelPatcher
-            # Now, when ComfyUI's samplers call model.forward(), it will be routed to our wrapper.
-            model.model = easycache_wrapper_instance
+            # Create an instance of our wrapper model (still created, but NOT used to patch model.model)
+            # easycache_wrapper_instance = EasyCacheModelWrapper( # Commented for this test
+            #     inner_model=original_underlying_model,
+            #     easycache_threshold=easycache_threshold,
+            #     easycache_warmup_steps=easycache_warmup_steps,
+            #     total_steps=steps
+            # )
+
+            # !!! IMPORTANT FOR THIS TEST: Temporarily commented out model patching !!!
+            # If this section is uncommented, EasyCache logic is applied.
+            # If commented, original model is used directly by samplers.sample.
+            # model.model = easycache_wrapper_instance # This line is commented for the test
 
             # Call ComfyUI's standard samplers.sample
-            latent_output = samplers.sample(
-                model, seed, steps, cfg, sampler_name, scheduler, positive_copy, negative_copy, latent_image, denoise
-            )
+            # It will now use the original model because model.model was NOT replaced
+            # Note: The 'easycache_enabled' flag is still respected for the overall node behavior,
+            # but the model patching part is bypassed for this specific test.
+            if not easycache_enabled: # This part remains for consistency with previous behavior
+                print("EasyCache is disabled. Running standard KSampler.")
+                latent_output = samplers.sample(
+                    model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise
+                )
+            else: # When easycache_enabled is True, but we're bypassing the wrapper for this test
+                print("EasyCache KSampler: Running with deepcopied inputs, but bypassing model wrapper for testing.")
+                latent_output = samplers.sample(
+                    model, seed, steps, cfg, sampler_name, scheduler, positive_copy, negative_copy, latent_image, denoise
+                )
 
-            print("EasyCache KSampler sampling completed.")
+
+            print("EasyCache KSampler sampling completed. (Wrapper Bypass Test)")
 
         finally:
-            # IMPORTANT: Always restore the original underlying model to the ModelPatcher
-            # This ensures that other nodes or subsequent runs use the unpatched model.
-            model.model = original_underlying_model
+            # !!! IMPORTANT FOR THIS TEST: This block is no longer needed if patching is commented out !!!
+            # model.model = original_underlying_model # This line is commented for the test
+            pass # Keep a pass statement if finally block is needed but nothing to do.
 
         return (latent_output,)
 
